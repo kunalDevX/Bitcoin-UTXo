@@ -1,0 +1,643 @@
+# 🪙 Bitcoin UTXO Viewer — Complete Project Explanation
+
+## 1. What Is This Project? (In Simple Terms)
+
+Imagine you have a Bitcoin wallet. Your "balance" is actually made up of many small pieces of Bitcoin — like having a wallet full of different denomination coins instead of one single bill. Each of those pieces is called a **UTXO** (Unspent Transaction Output).
+
+This project is a **full-stack web app** that:
+1. **Shows** you all the UTXOs of any Bitcoin address
+2. **Analyzes** how healthy your wallet is (too many tiny UTXOs = bad)
+3. **Estimates fees** for sending Bitcoin
+4. **Optimizes** which UTXOs to pick when you want to send a specific amount
+
+> **View-only** — it never touches your private keys. It only reads publicly available blockchain data.
+
+---
+
+## 2. What Problem Does It Solve?
+
+| Problem | How This App Solves It |
+|---|---|
+| "How much Bitcoin does this address have?" | Fetches and shows all UTXOs with real-time balances |
+| "My wallet has hundreds of tiny UTXOs — is that a problem?" | **Fragmentation Score** shows how fragmented your wallet is (0–100) |
+| "How much will it cost to send 0.1 BTC right now?" | **Live fee estimator** shows High/Medium/Low priority costs |
+| "Which UTXOs should I pick to minimize fees when sending?" | **Smart Coin Selection** runs two algorithms and picks the cheapest |
+| "What are dust outputs in my wallet?" | Flags any UTXO < 546 satoshis as "Dust" (unusable in practice) |
+
+---
+
+## 3. Tech Stack Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        FRONTEND                             │
+│  React 19 + Vite · Vanilla CSS · Recharts · Axios          │
+│  Runs on: http://localhost:5173                             │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ HTTP (REST API calls via Axios)
+┌─────────────────────▼───────────────────────────────────────┐
+│                        BACKEND                              │
+│  Node.js + Express · node-cache · Mongoose · Axios         │
+│  Runs on: http://localhost:5000                             │
+└──────┬──────────────────────────────────────┬───────────────┘
+       │                                      │
+┌──────▼──────┐                    ┌──────────▼──────────────┐
+│  MongoDB    │                    │  External Bitcoin APIs  │
+│  (optional) │                    │  mempool.space (primary)│
+│  Port 27017 │                    │  blockstream.info (fallback) │
+└─────────────┘                    └─────────────────────────┘
+```
+
+---
+
+## 4. Complete File-by-File Breakdown
+
+### 🏗️ BACKEND (`k:\New folder\backend\`)
+
+#### `package.json` — Dependencies
+| Package | Purpose |
+|---|---|
+| `express` | Web server framework |
+| `cors` | Allows browser (frontend) to call the backend |
+| `dotenv` | Loads config from `.env` file |
+| `axios` | Makes HTTP requests to Bitcoin APIs |
+| `mongoose` | Connects to and queries MongoDB |
+| `node-cache` | Fast in-memory caching (avoids repeated API calls) |
+| `nodemon` | Dev tool: auto-restarts server when files change |
+
+---
+
+#### `src/app.js` — Backend Entry Point
+This is the **starting point** of the entire backend. It:
+1. Loads environment variables from `.env`
+2. Connects to MongoDB (optional — app still works without it)
+3. Sets up CORS so the React frontend can talk to it
+4. Registers all API routes under `/api`
+5. Registers the global error handler
+6. Starts listening on port 5000
+
+```
+app.js
+├── connectDB()          ← connects to MongoDB
+├── cors()               ← allows frontend at :5173
+├── /health              ← health check endpoint
+├── /api → apiRouter     ← all real routes
+└── errorHandler         ← catches all unhandled errors
+```
+
+---
+
+#### `src/config/db.js` — Database Connection
+- Calls `mongoose.connect()` with the MongoDB URI from `.env`
+- **Non-fatal**: if MongoDB is down, it logs a warning but the server **continues running**
+- The app gracefully skips DB operations when disconnected
+
+#### `src/config/cache.js` — In-Memory Cache
+- Uses `node-cache` with a **5-minute TTL** (configurable via `CACHE_TTL` in `.env`)
+- Caches UTXO data per address: key = `utxos_<address>`
+- Caches fee rates: key = `fee_rates` (60-second TTL)
+- This prevents hammering the external Bitcoin APIs on every request
+
+---
+
+#### `src/models/Utxo.js` — MongoDB UTXO Schema
+Defines what a UTXO record looks like in the database:
+```
+{
+  txid:          String  ← transaction ID (64-char hex)
+  vout:          Number  ← output index within the transaction
+  value:         Number  ← amount in satoshis (1 BTC = 100,000,000 sat)
+  blockHeight:   Number  ← which block confirmed this UTXO
+  confirmations: Number  ← how many blocks deep (tipHeight - blockHeight + 1)
+  scriptType:    String  ← P2PKH / P2SH / P2WPKH / P2TR etc.
+  address:       String  ← the Bitcoin address it belongs to
+  timestamps:    auto    ← createdAt, updatedAt
+}
+```
+**Unique index** on `(address, txid, vout)` prevents duplicate records.
+
+#### `src/models/Address.js` — MongoDB Address Schema
+Tracks which addresses have been looked up:
+```
+{
+  address:     String  ← the Bitcoin address
+  lastFetched: Date    ← when UTXOs were last refreshed
+  utxoCount:   Number  ← how many UTXOs the address has
+}
+```
+
+---
+
+#### `src/utils/addressValidator.js` — Bitcoin Address Validator
+Validates Bitcoin addresses using a **regex pattern** before doing any API calls:
+- `1...` → P2PKH (Legacy addresses)
+- `3...` → P2SH (Script hash, often multi-sig)
+- `bc1...` → Bech32 (SegWit addresses including Taproot)
+
+Returns `{ valid: true }` or `{ valid: false, message: "..." }`.
+
+---
+
+#### `src/middleware/validate.js` — Request Validation Middleware
+A reusable middleware that:
+- Reads `address` from either `req.params` or `req.body`
+- Calls `validateBitcoinAddress()` on it
+- Returns HTTP 400 if invalid, otherwise calls `next()` to continue
+
+#### `src/middleware/errorHandler.js` — Global Error Handler
+The last middleware Express runs. It:
+- Catches any error thrown in routes
+- Returns a clean JSON error response with the right HTTP status
+- In `development` mode, also includes the stack trace
+
+---
+
+#### `src/services/utxoService.js` — Core UTXO Logic ⭐
+
+This is the most important file in the backend. It has 3 layers:
+
+**Layer 1: `fetchFromAPI(address)`**
+```
+1. Try mempool.space/api/address/{address}/utxo
+   AND mempool.space/api/blocks/tip/height (to calculate confirmations)
+   
+   IF mempool.space returns "Too many unspent outputs" (>500 UTXOs):
+       → Fall back to Blockstream
+   IF 4xx error (bad address):
+       → Throw error immediately (don't retry)
+   IF 5xx / network error:
+       → Fall back to Blockstream
+
+2. Try blockstream.info/api/address/{address}/utxo
+   IF this also fails → throw "All Bitcoin APIs failed"
+```
+
+**Layer 2: `fetchAndStoreUtxos(address)`**
+```
+1. Call fetchFromAPI() to get raw UTXO data
+2. Transform each raw UTXO:
+   - Calculate confirmations = tipHeight - blockHeight + 1
+   - Map scriptpubkey_type to human label (v0_p2wpkh → P2WPKH)
+3. If MongoDB is connected:
+   - bulkWrite (upsert) all UTXOs
+   - Delete any UTXOs that are no longer returned (they were spent)
+   - Update the Address record (lastFetched, utxoCount)
+4. Update in-memory cache
+5. Return UTXOs array
+```
+
+**Layer 3: `getUtxos(address)`** — The public-facing function
+```
+Cache hit?         → return from cache (fastest)
+MongoDB connected? → check DB first, return if found
+Neither?           → call fetchAndStoreUtxos() (live API fetch)
+```
+
+---
+
+#### `src/services/analysisService.js` — UTXO Analysis ⭐
+
+Takes an array of UTXOs and computes wallet health metrics:
+
+| Metric | How It's Calculated |
+|---|---|
+| `totalBalance` | Sum of all UTXO values in satoshis |
+| `totalBalanceBTC` | totalBalance ÷ 100,000,000 |
+| `count` | Number of UTXOs |
+| `avgValue` | totalBalance ÷ count |
+| `minValue` / `maxValue` | Min/max across all UTXOs |
+| `dustCount` | UTXOs where value < 546 satoshis |
+| `dustPercentage` | dustCount ÷ count × 100 |
+| `fragmentationScore` | Custom formula (see below) |
+| `valueDistribution` | Count of UTXOs in 5 size buckets |
+
+**Fragmentation Score Formula (0–100):**
+```
+normalizedCount = min(utxoCount / 100, 1.0)     ← 100+ UTXOs = score of 1.0
+normalizedSize  = 1 - min(avgValue / (total/10), 1.0)  ← many small UTXOs → high
+rawScore        = (normalizedCount × 0.5 + normalizedSize × 0.5) × 100
+
+Labels:
+  0–39  → Low     (wallet is clean)
+  40–69 → Medium  (some fragmentation)
+  70–100→ High    (wallet needs consolidation)
+```
+
+**Value Distribution Buckets (for chart):**
+```
+< 1,000 sat    → "< 1K sat"
+1,000–10,000   → "1K–10K"
+10,000–100,000 → "10K–100K"
+100,000–1M     → "100K–1M"
+> 1,000,000    → "> 1M sat"
+```
+
+---
+
+#### `src/services/coinSelectionService.js` — Coin Selection Algorithms ⭐
+
+**Transaction Size Formula:**
+```
+txSize = (inputs × 148) + (outputs × 34) + 10 bytes
+```
+This is a standard Bitcoin Legacy transaction size estimate.
+- Each input = ~148 bytes
+- Each output = ~34 bytes
+- Base overhead = 10 bytes
+
+**Algorithm 1: Greedy (Largest First)**
+```
+1. Sort all UTXOs by value, largest first
+2. Pick UTXOs one by one until total ≥ target
+3. Stop as soon as target is met
+Result: may use fewer large UTXOs → smaller tx → lower fee
+```
+
+**Algorithm 2: Minimum Inputs**
+```
+1. Sort all UTXOs by value, largest first
+2. Pick UTXOs until total ≥ target, but stop immediately
+Result: uses the absolute fewest inputs possible → smallest tx size
+```
+*(In practice both algorithms are similar for sorted data, but the Greedy one picks the target more loosely while Minimum Inputs stops exactly at the threshold.)*
+
+**Winner Selection:**
+```
+Compare estimatedFee of both strategies
+Winner = whichever has the LOWER estimated fee
+```
+
+---
+
+#### `src/services/feeService.js` — Live Fee Estimation
+
+1. Calls `mempool.space/api/v1/fees/recommended` to get real-time fee rates:
+   - `fastestFee` → confirms in ~10 min
+   - `halfHourFee` → confirms in ~30 min
+   - `hourFee` → confirms in ~1 hour
+   - `economyFee` → very slow/cheap
+
+2. For each priority level, calculates:
+   ```
+   fee = txSize × feeRate (in sat/vB)
+   ```
+
+3. Fee rates are cached for **60 seconds** to avoid hammering mempool.space.
+
+---
+
+#### `src/routes/api.js` — All API Endpoints
+
+| Method | Endpoint | What It Does |
+|---|---|---|
+| `POST` | `/api/address` | Registers address, fetches & stores UTXOs |
+| `GET` | `/api/utxos/:address` | Returns cached/stored UTXOs |
+| `GET` | `/api/analysis/:address` | Returns full analysis stats |
+| `POST` | `/api/optimize` | Runs both coin selection algorithms |
+| `GET` | `/api/fee` | Returns live fee rates & estimates |
+| `GET` | `/health` | Health check (not under /api) |
+
+---
+
+### 🖥️ FRONTEND (`k:\New folder\frontend\`)
+
+#### `package.json` — Dependencies
+| Package | Purpose |
+|---|---|
+| `react` + `react-dom` | UI framework |
+| `react-router-dom` | Page routing |
+| `axios` | HTTP client for API calls |
+| `recharts` | Chart library (bar charts for distribution) |
+| `vite` | Build tool and dev server |
+
+---
+
+#### `src/main.jsx` — React Entry Point
+Mounts the React app to `<div id="root">` in `index.html`. Sets up React Router.
+
+#### `src/App.jsx` — Router
+Defines routes. Currently just one route: `/` → `<Dashboard />`.
+
+---
+
+#### `src/api/apiClient.js` — Axios Instance
+Creates a pre-configured Axios instance:
+- `baseURL`: `http://localhost:5000/api` (from env variable `VITE_API_URL`)
+- `timeout`: 15 seconds
+
+#### `src/api/utxoApi.js` — API Call Functions
+5 exported functions used by the Dashboard:
+```javascript
+submitAddress(address)          → POST /api/address
+fetchUtxos(address)             → GET  /api/utxos/:address
+fetchAnalysis(address)          → GET  /api/analysis/:address
+fetchFees(inputs, outputs)      → GET  /api/fee?inputs=1&outputs=2
+optimizeUtxos(address, targetBTC) → POST /api/optimize
+```
+
+---
+
+#### `src/pages/Dashboard.jsx` — The Main Brain 🧠
+
+This is the **single page** of the app. It manages ALL the state:
+
+| State Variable | What It Holds |
+|---|---|
+| `address` | Currently loaded Bitcoin address |
+| `utxos` | Array of UTXO objects |
+| `analysis` | Analysis stats object |
+| `feeData` | Live fee rates + estimates |
+| `optimizeData` | Coin selection results (both strategies) |
+| `selectedTxids` | TXIDs of UTXOs chosen by the winning strategy |
+| `fetchLoading` | True while fetching UTXOs |
+| `feeLoading` | True while fetching fees |
+| `optimizeLoading` | True while running optimization |
+| `error` | Error message to show user |
+
+**`handleFetch(addr)` — called when user clicks "Fetch UTXOs":**
+```
+1. setFetchLoading(true), clear previous data
+2. POST /api/address              ← register address, trigger API fetch
+3. Parallel: GET /api/utxos       ← get UTXOs
+           + GET /api/analysis    ← get analysis stats
+4. setUtxos(), setAnalysis()
+5. GET /api/fee                   ← load live fees (separate loading state)
+6. setFeeData()
+```
+
+**`handleOptimize(targetBTC)` — called when user clicks "Run Optimization":**
+```
+1. setOptimizeLoading(true)
+2. POST /api/optimize { address, targetBTC }
+3. setOptimizeData(result)
+4. Highlight winning strategy's UTXOs in the table (setSelectedTxids)
+```
+
+---
+
+### Frontend Components (All 8)
+
+#### `AddressInput.jsx`
+- Text input for Bitcoin address
+- Submit button triggers `onFetch(address)` callback
+- Shows loading state
+
+#### `StatsCards.jsx`
+- Displays 5 metric cards from `analysis` data:
+  1. **Total Balance** (BTC + satoshis)
+  2. **UTXO Count**
+  3. **Avg UTXO Size**
+  4. **Dust Outputs** (red if > 0)
+  5. **Fragmentation Score** (color-coded: green/orange/red)
+
+#### `UtxoTable.jsx`
+- Sortable table of all UTXOs (click column header to sort)
+- Columns: TX ID (truncated), Index, Amount (BTC), Amount (sat), Block Height, Confirmations, Script Type, Status
+- **Status badge logic:**
+  - `⚠ Dust` → value < 546 sat (red)
+  - `✓ Selected` → this UTXO was picked by the optimizer (green)
+  - `Normal` → everything else
+
+#### `DistributionChart.jsx`
+- Bar chart (using Recharts) showing how many UTXOs fall into each value bucket
+- Buckets: < 1K sat, 1K–10K, 10K–100K, 100K–1M, > 1M sat
+
+#### `FragmentationMeter.jsx`
+- Visual progress-bar style meter showing the fragmentation score (0–100)
+- Color changes: green (low) → orange (medium) → red (high)
+- Shows the label (Low/Medium/High)
+
+#### `FeeEstimator.jsx`
+- Shows 3 fee rows: High / Medium / Low priority
+- Each row shows: fee rate (sat/vB), tx size, total fee in sat, total fee in BTC
+- Also shows the Economy rate
+
+#### `CoinSelector.jsx`
+- Number input for target send amount in BTC
+- "Run Optimization" button → calls `onOptimize(targetBTC)`
+- Disabled if no address is loaded yet
+
+#### `ComparisonTable.jsx`
+- Shows results of both coin selection strategies side by side
+- Winner strategy gets a green border + "✓ Best Strategy" badge
+- Shows savings calculation (how much cheaper the winner is)
+- Includes a flat comparison table at the bottom
+
+---
+
+## 5. Complete Data Flow — Step by Step
+
+### Flow A: User Looks Up a Bitcoin Address
+
+```
+USER types address → clicks "Fetch UTXOs"
+        │
+        ▼
+Dashboard.handleFetch()
+        │
+        ▼ POST /api/address { address: "bc1q..." }
+Backend: validateAddress middleware
+        │  Is address format valid? (regex check)
+        │  NO → HTTP 400 error back to frontend
+        │  YES → continue
+        │
+        ▼ fetchAndStoreUtxos("bc1q...")
+        │
+        ▼ fetchFromAPI()
+        │  → GET mempool.space/api/address/bc1q.../utxo
+        │  → GET mempool.space/api/blocks/tip/height
+        │
+        │  Success? → use data
+        │  "Too many UTXOs"? → fallback to Blockstream
+        │  Blockstream also fails? → throw error
+        │
+        ▼ Transform raw API data
+        │  { txid, vout, value, blockHeight, confirmations, scriptType, address }
+        │
+        ▼ MongoDB connected?
+        │  YES → bulkWrite (upsert all UTXOs), delete spent ones, update Address
+        │  NO  → skip DB, continue
+        │
+        ▼ Write to in-memory cache (key: "utxos_bc1q...")
+        │
+        ▼ Return { success: true, count: N, address }
+        │
+        │ (simultaneously in frontend)
+        ▼ GET /api/utxos/bc1q...
+        │  Check cache → HIT → return from cache immediately
+        │
+        ▼ GET /api/analysis/bc1q...
+        │  getUtxos() → from cache
+        │  analyzeUtxos(utxos) → compute all metrics
+        │  Return analysis object
+        │
+        ▼ GET /api/fee?inputs=1&outputs=2
+        │  Check cache (key: "fee_rates")
+        │  MISS → GET mempool.space/api/v1/fees/recommended
+        │  Cache result for 60 seconds
+        │  Calculate fee for 1 input, 2 outputs at each priority
+        │  Return { rates: {...}, estimation: {...} }
+        │
+        ▼ Frontend updates state:
+          setUtxos([...])    → UtxoTable renders
+          setAnalysis({...}) → StatsCards, DistributionChart, FragmentationMeter render
+          setFeeData({...})  → FeeEstimator renders
+```
+
+---
+
+### Flow B: User Runs Coin Optimization
+
+```
+USER types "0.005" BTC → clicks "Run Optimization"
+        │
+        ▼
+Dashboard.handleOptimize(0.005)
+        │
+        ▼ POST /api/optimize { address: "bc1q...", targetBTC: 0.005 }
+        │
+Backend: validate address format
+        │
+        ▼ targetSatoshis = 0.005 × 100,000,000 = 500,000 sat
+        │
+        ▼ getUtxos("bc1q...") → from cache (already loaded)
+        │
+        ▼ getFeerate() → from cache or live API
+        │  Use halfHourFee (medium priority)
+        │
+        ▼ Run Algorithm 1: greedySelect(utxos, 500000)
+        │  Sort by value descending
+        │  Pick: [0.003, 0.002] → total = 500,000 sat ✓
+        │  txSize = (2 × 148) + (2 × 34) + 10 = 374 bytes
+        │  estimatedFee = 374 × feeRate
+        │  change = 500,000 - 500,000 - fee
+        │
+        ▼ Run Algorithm 2: minimumInputsSelect(utxos, 500000)
+        │  Same sorting, but stops at first UTXO ≥ target
+        │  e.g. picks [0.006] → total = 600,000 sat
+        │  txSize = (1 × 148) + (2 × 34) + 10 = 226 bytes
+        │  estimatedFee = 226 × feeRate (cheaper!)
+        │
+        ▼ Compare estimatedFee → pick winner
+        │
+        ▼ Return { greedy: {...}, minInputs: {...}, winner: "minInputs" }
+        │
+        ▼ Frontend:
+          setOptimizeData(result) → ComparisonTable renders
+          setSelectedTxids([txid of winning UTXO]) → highlights in UtxoTable
+```
+
+---
+
+## 6. Caching Strategy — Three-Tier Architecture
+
+```
+Request for UTXOs
+        │
+        ▼ Tier 1: In-Memory Cache (node-cache)
+        │  TTL: 5 minutes (300 seconds)
+        │  HIT → instant response (< 1ms)
+        │  MISS ↓
+        │
+        ▼ Tier 2: MongoDB
+        │  Persistent storage
+        │  HIT → return from DB, populate cache
+        │  MISS or DB down ↓
+        │
+        ▼ Tier 3: Live Bitcoin API
+           mempool.space (primary)
+           blockstream.info (fallback)
+           Slow (~1–3 seconds) but always fresh
+           → stores result in both DB and cache
+```
+
+---
+
+## 7. Error Handling Strategy
+
+```
+addressValidator   → validates format BEFORE any API calls
+    ↓
+middleware/validate → reusable Express middleware for routes
+    ↓
+upstreamError()    → converts API 4xx responses to clean errors
+    ↓
+errorHandler.js    → catches ALL unhandled errors, returns JSON
+    ↓
+Frontend           → reads err.response?.data?.error and shows it
+```
+
+Special cases handled:
+- **"Too many unspent outputs"** from mempool.space → auto-fallback to Blockstream
+- **MongoDB down** → server continues, just uses cache + live API
+- **Both APIs down** → "All Bitcoin APIs failed. Please try again later."
+- **Insufficient funds** in optimizer → graceful error per strategy
+
+---
+
+## 8. Security Considerations
+
+- **No private keys** — the app only reads public blockchain data
+- **Bitcoin address validation** before any external call — prevents SSRF-like abuse
+- **CORS restricted** to `CLIENT_URL` (localhost:5173 by default)
+- **Timeout on all Axios calls** — prevents hanging requests (8–12 sec)
+- **Error messages sanitized** — internal stack traces only shown in dev mode
+
+---
+
+## 9. What Each Environment Variable Does
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | 5000 | Backend server port |
+| `MONGO_URI` | `mongodb://localhost:27017/bitcoin_utxo` | MongoDB connection string |
+| `CLIENT_URL` | `http://localhost:5173` | Allowed CORS origin (your frontend URL) |
+| `MEMPOOL_API` | `https://mempool.space/api` | Primary Bitcoin API |
+| `BLOCKSTREAM_API` | `https://blockstream.info/api` | Fallback Bitcoin API |
+| `CACHE_TTL` | 300 | Seconds to keep UTXO data in memory |
+| `NODE_ENV` | development | Controls stack trace visibility |
+| `VITE_API_URL` | `http://localhost:5000/api` | Frontend: which backend to call |
+
+---
+
+## 10. Visual Layout of the Single-Page App
+
+```
+┌─────────────────────────────────────────────────────┐
+│ HEADER: ₿ UTXO Viewer    [address badge] [Mainnet]  │
+├─────────────────────────────────────────────────────┤
+│ AddressInput: [bc1q...input field] [Fetch UTXOs]    │
+├─────────────────────────────────────────────────────┤
+│ StatsCards: [Balance] [Count] [Avg] [Dust] [Fragm.] │
+├──────────────────────┬──────────────────────────────┤
+│ DistributionChart    │ FragmentationMeter            │
+│ (bar chart by range) │ + Min/Max/Dust mini stats     │
+├─────────────────────────────────────────────────────┤
+│ UtxoTable (sortable, with Selected/Dust badges)     │
+├──────────────────────┬──────────────────────────────┤
+│ FeeEstimator         │ CoinSelector                  │
+│ High/Med/Low rates   │ [target BTC input] [Optimize] │
+├─────────────────────────────────────────────────────┤
+│ ComparisonTable: Greedy vs Min-Inputs results       │
+│ Winner highlighted in green                         │
+├─────────────────────────────────────────────────────┤
+│ FOOTER: Powered by Blockstream & Mempool.space      │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 11. Key Bitcoin Concepts Used in This App
+
+| Term | Meaning in This App |
+|---|---|
+| **UTXO** | "Unspent Transaction Output" — a piece of Bitcoin you received and haven't spent yet |
+| **Satoshi (sat)** | Smallest Bitcoin unit. 1 BTC = 100,000,000 satoshis |
+| **Dust** | UTXOs < 546 sat — so small the fee to spend them exceeds their value |
+| **Confirmations** | How many blocks have been mined since the tx was included. More = safer |
+| **Block Height** | The sequential number of the block containing this transaction |
+| **scriptType** | P2PKH/P2SH/P2WPKH/P2TR — different Bitcoin address/script formats |
+| **fee rate (sat/vB)** | Satoshis per virtual byte — how fast your transaction gets confirmed |
+| **coin selection** | Choosing WHICH UTXOs to use as inputs for a new transaction |
+| **fragmentation** | Having many small UTXOs — costs more in fees to spend later |
+| **Taproot (P2TR)** | Newest Bitcoin address format starting with `bc1p` |
